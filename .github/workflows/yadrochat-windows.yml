@@ -1,0 +1,244 @@
+# Сборка ЯдроЧата под Windows.
+#
+# Этот файл КОПИРУЕТСЯ в форк `mattermost/desktop` скриптом
+# `branding/apply-desktop.sh` как `.github/workflows/yadrochat-windows.yml`.
+# Правится он ЗДЕСЬ, в «Ядре», и переезжает в форк прогоном скрипта — правка
+# копии в форке потеряется при следующем прогоне.
+#
+# Имя `yadrochat-*` намеренно: у апстрима двадцать с лишним своих workflow, и
+# файл с его именем затёрся бы слиянием.
+#
+# Раннер, версия Node и способ установки зависимостей взяты у самого апстрима
+# (`.github/workflows/build-for-pr.yml`), а не подобраны: `windows-2022`,
+# `.nvmrc` и `npm ci --openssl_fips=''` — у него это работает, и расходиться с
+# ним без причины значит ловить чужие отказы на своей стороне.
+
+name: ЯдроЧат — сборка под Windows
+
+on:
+  # Основной способ — кнопкой. Сборка нужна к выпуску, а не на каждый коммит:
+  # раннеры Windows тарифицируются вдвое дороже обычных.
+  workflow_dispatch:
+    inputs:
+      zip_too:
+        description: "Собрать ещё и .zip (портативный, без установки)"
+        type: boolean
+        default: false
+  # Тег вида v1.0.0 — выпуск.
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  # Вторая сборка того же ref отменяет первую: две одновременные ничего не
+  # добавляют, а очередь Windows-раннеров занимают надолго.
+  group: yadrochat-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: MSI
+    runs-on: windows-2022
+    timeout-minutes: 60
+
+    env:
+      # Контекст `secrets` НЕ доступен в `if` у шага — только в `env` у джобы.
+      # Поэтому наличие сертификата переносится сюда флагом, а шаги смотрят уже
+      # на него. Написать `if: secrets.X != ''` нельзя: условие молча окажется
+      # ложным, и подпись не выполнится НИКОГДА при заведённом секрете.
+      HAS_CERT: ${{ secrets.WINDOWS_CERT_BASE64 != '' }}
+
+    steps:
+      - name: Забрать исходники
+        uses: actions/checkout@v4
+
+      - name: Node по .nvmrc
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: ".nvmrc"
+          cache: "npm"
+          cache-dependency-path: package-lock.json
+
+      # ─────────────────────────────────────────────────────────────────
+      # БРЕНДИНГ ПРЯМО В СБОРКЕ, если в форке лежит комплект `yadrochat-brand/`.
+      #
+      # Так форк готовится БЕЗ Linux и без растеризатора: комплект везёт готовые
+      # иконки, а текстовые правки делает shell-скрипт, который на раннере
+      # Windows исполняет Git Bash. Человеку с Windows-машины остаётся форк,
+      # загрузка папки и кнопка.
+      #
+      # Побочная выгода важнее удобства: вендорские файлы в форке НЕ ПРАВЯТСЯ
+      # вовсе, поэтому `git merge upstream` не конфликтует никогда, а забыть
+      # переприменить бренд после обновления попросту невозможно — он
+      # применяется каждой сборкой заново.
+      #
+      # Комплекта нет — значит бренд применили заранее на своей машине; шаг
+      # пропускается, дальше всё как раньше.
+      - name: Применить бренд
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Комплект приезжает ДВУМЯ путями, и оба законны.
+          #
+          # Папкой — когда её удалось перетащить в веб-интерфейс GitHub.
+          # АРХИВОМ — когда не удалось: перетаскивание ПАПКИ в «Upload files»
+          # работает не в каждом браузере и не из каждого файлового менеджера,
+          # а один файл принимается всегда. Человеку, у которого получилось
+          # положить только .zip, незачем воевать с браузером — распакуем сами.
+          if [ ! -f yadrochat-brand/apply-desktop.sh ]; then
+            zipfile="$(find . -maxdepth 2 -name 'yadrochat-kit*.zip' -print -quit)"
+            if [ -n "$zipfile" ]; then
+              echo "Комплект найден архивом: $zipfile"
+              # Распаковка ПИТОНОМ, а не `unzip`: его нет в Git Bash на
+              # раннере Windows, а питон есть на обоих. Один способ на обе
+              # платформы — у стенда не бывает двух режимов с разным исходом.
+              python -c "import sys,zipfile; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])" \
+                     "$zipfile" "$RUNNER_TEMP/kit"
+              found="$(find "$RUNNER_TEMP/kit" -name apply-desktop.sh -print -quit)"
+              if [ -n "$found" ]; then
+                # Кладём на штатное место: дальше и заслон, и всё остальное
+                # ищут комплект там же, что и при загрузке папкой.
+                cp -r "$(dirname "$found")" yadrochat-brand
+                echo "Комплект развёрнут в yadrochat-brand/"
+              fi
+            fi
+          fi
+
+          if [ -f yadrochat-brand/apply-desktop.sh ]; then
+            bash yadrochat-brand/apply-desktop.sh .
+          else
+            # Не отказ: бренд мог быть применён заранее, на своей машине.
+            # Если это не так — следующим шагом откажет заслон, и он назовёт
+            # причину точнее, чем можно назвать здесь.
+            echo "Комплекта нет — считаю, что бренд применён заранее."
+          fi
+
+      # ─────────────────────────────────────────────────────────────────
+      # ЗАСЛОН. Стоит ДО установки зависимостей: если бренд не применён,
+      # незачем тратить двадцать минут на сборку, которую всё равно нельзя
+      # раздавать.
+      #
+      # Сценарий, ради которого он написан: подтянули апстрим, `git merge`
+      # вернул вендорские файлы, скрипты брендинга прогнать забыли. Сборка
+      # проходит и носит имя, логотип и адреса обновлений Mattermost.
+      # ─────────────────────────────────────────────────────────────────
+      - name: Проверить, что бренд применён
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Заслон лежит либо в корне (форк готовили скриптом с Linux), либо
+          # внутри комплекта (форк готовили загрузкой папки). Проверка обязана
+          # идти в обоих случаях, поэтому ищется, а не задаётся одним путём.
+          for candidate in yadrochat-verify-brand.py yadrochat-brand/verify-brand.py; do
+            if [ -f "$candidate" ]; then
+              python "$candidate" .
+              exit 0
+            fi
+          done
+          echo "::error::заслон бренда не найден — ни yadrochat-verify-brand.py, ни yadrochat-brand/verify-brand.py"
+          exit 1
+
+      - name: Установить зависимости
+        env:
+          # Playwright тянет браузеры на сотни мегабайт. Для сборки они не
+          # нужны — так же делает и апстрим.
+          PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: 1
+        run: npm ci --openssl_fips=''
+
+      # ─────────────────────────────────────────────────────────────────
+      # ПОДПИСЬ. Необязательна, но без неё Windows покажет «издатель
+      # неизвестен», и для сотрудника это выглядит как «прислали вирус».
+      #
+      # Секреты заводятся в Settings → Secrets and variables → Actions:
+      #   WINDOWS_CERT_BASE64   — файл .pfx, закодированный base64
+      #   WINDOWS_CERT_PASSWORD — пароль к нему
+      #
+      # Нет секретов — собираем без подписи и ГОВОРИМ об этом в итоге, а не
+      # молчим: неподписанная сборка, выданная за обычную, дороже отсутствия
+      # сборки.
+      # ─────────────────────────────────────────────────────────────────
+      - name: Разложить сертификат подписи
+        id: signing
+        if: env.HAS_CERT == 'true'
+        shell: bash
+        run: |
+          echo "${{ secrets.WINDOWS_CERT_BASE64 }}" | base64 -d > "$RUNNER_TEMP/cert.pfx"
+          echo "pfx=$RUNNER_TEMP/cert.pfx" >> "$GITHUB_OUTPUT"
+          echo "signed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Собрать установщик
+        env:
+          # electron-builder читает подпись из этих переменных. Пустые —
+          # собирает без подписи, это его штатное поведение.
+          CSC_LINK: ${{ steps.signing.outputs.pfx }}
+          CSC_KEY_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+        run: npm run package:windows-msi
+
+      - name: Собрать портативный .zip
+        if: ${{ inputs.zip_too || startsWith(github.ref, 'refs/tags/v') }}
+        env:
+          CSC_LINK: ${{ steps.signing.outputs.pfx }}
+          CSC_KEY_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+        run: npm run package:windows-zip
+
+      # Убрать сертификат с диска раннера сразу после сборки. Раннер и так
+      # одноразовый, но секрет не должен лежать дольше, чем нужен.
+      - name: Убрать сертификат
+        if: ${{ always() && steps.signing.outputs.signed == 'true' }}
+        shell: bash
+        run: rm -f "$RUNNER_TEMP/cert.pfx"
+
+      - name: Что собралось
+        id: out
+        shell: bash
+        run: |
+          {
+            echo "### ЯдроЧат — сборка под Windows"
+            echo ""
+            if [ "${{ steps.signing.outputs.signed }}" = "true" ]; then
+              echo "Подпись: **есть**."
+            else
+              echo "Подпись: **НЕТ**. Windows покажет «издатель неизвестен» —"
+              echo "для сотрудника это выглядит как «прислали вирус»."
+              echo "Как включить — в комментарии к этому workflow."
+            fi
+            echo ""
+            echo "| файл | размер |"
+            echo "|---|---|"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          found=0
+          while IFS= read -r f; do
+            found=1
+            # shellcheck disable=SC2016  # обратные кавычки здесь — разметка
+            # таблицы итога, а не подстановка команды; одинарные кавычки верны
+            printf '| `%s` | %s |\n' "$(basename "$f")" \
+              "$(du -h "$f" | cut -f1)" >> "$GITHUB_STEP_SUMMARY"
+          done < <(find release -maxdepth 2 -type f \( -name '*.msi' -o -name '*.zip' \) 2>/dev/null | sort)
+
+          # Пустая выдача обязана называть себя пустой: «собралось, 0 файлов»
+          # без единого слова читается как успех.
+          if [ "$found" = 0 ]; then
+            echo "| — | **ничего не собралось** |" >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::в release/ нет ни одного .msi — сборка молча не дала результата"
+            exit 1
+          fi
+
+          {
+            echo ""
+            echo "Перед раздачей: поставить на чистую машину и убедиться, что"
+            echo "приложение открывает НАШ сервер без ввода адреса."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Выложить сборку
+        uses: actions/upload-artifact@v4
+        with:
+          name: yadrochat-windows-${{ github.run_number }}
+          path: |
+            release/**/*.msi
+            release/**/*.zip
+          if-no-files-found: error
+          retention-days: 30
